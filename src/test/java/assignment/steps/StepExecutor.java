@@ -103,10 +103,8 @@ public final class StepExecutor {
             if (failure instanceof AssertionError assertion) throw assertion;
             throw new IllegalStateException("Step %d %s failed".formatted(step.order(), step.action()), failure);
         }
-        // Only return observations useful in the report; typed values stay out of it.
-        return step.action().startsWith("ASSERT_") || step.action().startsWith("VERIFY_")
-                || Set.of("PRINT_TO_PDF", "CLICK_IF_PRESENT", "CHANGE_CHECKBOX",
-                    "WAIT_FOR_AUTHENTICATION").contains(step.action()) || javaScriptClickUsed ? actual : "";
+        // Tell the report what this step did. Typed values are never included.
+        return actual;
     }
 
     // Number filenames by step and label them before or after.
@@ -124,18 +122,18 @@ public final class StepExecutor {
                 String url = resolve(value(step.inputKey()));
                 activeFrameKey = null;
                 driver.navigate().to(url);
-                yield driver.getCurrentUrl();
+                yield "Opened " + driver.getCurrentUrl();
             }
             case "TYPE" -> {
                 String input = resolve(value(step.inputKey()));
                 WebElement element = visible(step);
                 element.clear();
                 element.sendKeys(input);
-                yield "Entered " + step.inputKey();
+                yield "Typed " + label(step.inputKey()) + " into " + label(step.locatorKey());
             }
             case "CLICK" -> {
                 safeClick(clickable(step));
-                yield "Clicked " + step.locatorKey();
+                yield "Clicked " + label(step.locatorKey());
             }
             // Missing optional controls are logged. A visible but unusable control still fails.
             case "CLICK_IF_PRESENT" -> {
@@ -144,15 +142,16 @@ public final class StepExecutor {
                 catch (TimeoutException absent) {
                     if (driver.findElements(by(step.locatorKey())).stream().anyMatch(WebElement::isDisplayed)) throw absent;
                     // For transcript Submit, absence is still a requirement gap, not proof of a click.
-                    yield "Optional control absent: " + step.locatorKey();
+                    yield label(step.locatorKey()) + " is absent, so it was skipped";
                 }
                 safeClick(element);
-                yield "Clicked optional control: " + step.locatorKey();
+                yield "Clicked " + label(step.locatorKey());
             }
             // Save the date before using the picker, then require it to change.
             case "REMEMBER_VALUE" -> {
-                rememberedValues.put(step.locatorKey(), visible(step).getDomProperty("value"));
-                yield "";
+                String current = visible(step).getDomProperty("value");
+                rememberedValues.put(step.locatorKey(), current);
+                yield "Noted the starting " + label(step.locatorKey()) + ": " + current;
             }
             case "ASSERT_VALUE_CHANGED" -> {
                 String original = rememberedValues.get(step.locatorKey());
@@ -172,7 +171,7 @@ public final class StepExecutor {
             case "SELECT_TEXT" -> {
                 String option = resolve(value(step.inputKey()));
                 new Select(visible(step)).selectByVisibleText(option);
-                yield option;
+                yield "Selected " + option + " in " + label(step.locatorKey());
             }
             case "CHOOSE_OPTION" -> {
                 String option = resolve(value(step.inputKey()));
@@ -181,13 +180,13 @@ public final class StepExecutor {
                 By choice = optionLocator(option);
                 wait(step).until(ignored -> driver.findElements(choice).stream()
                     .filter(WebElement::isDisplayed).findFirst().orElse(null)).click();
-                yield option;
+                yield "Chose " + option + " in " + label(step.locatorKey());
             }
             case "SCROLL_INTO_VIEW" -> {
                 WebElement element = visible(step);
                 ((JavascriptExecutor) driver).executeScript(
                     "arguments[0].scrollIntoView({block:'center', inline:'nearest'});", element);
-                yield "Scrolled to " + step.locatorKey();
+                yield "Scrolled to " + label(step.locatorKey());
             }
             case "CONTEXT_CLICK" -> {
                 contextMenuLocator = step.locatorKey();
@@ -198,7 +197,7 @@ public final class StepExecutor {
                 } else {
                     new Actions(driver).contextClick(element).pause(Duration.ofSeconds(2)).perform();
                 }
-                yield "Right-clicked " + step.locatorKey();
+                yield "Right-clicked " + label(step.locatorKey());
             }
             case "SET_CHECKBOX", "CHANGE_CHECKBOX" -> {
                 String input = resolve(value(step.inputKey()));
@@ -233,12 +232,12 @@ public final class StepExecutor {
             case "SWITCH_TO_IFRAME" -> {
                 wait(step).until(ExpectedConditions.frameToBeAvailableAndSwitchToIt(by(step.locatorKey())));
                 activeFrameKey = step.locatorKey();
-                yield "Switched to " + step.locatorKey();
+                yield "Switched into " + label(step.locatorKey());
             }
             case "SWITCH_TO_DEFAULT_CONTENT" -> {
                 activeFrameKey = null;
                 driver.switchTo().defaultContent();
-                yield "Switched to default content";
+                yield "Switched back to the main page";
             }
             case "WAIT_FOR_AUTHENTICATION" -> waitForAuthentication(step);
             case "WAIT_FOR_LOADING_COMPLETE" -> waitForLoadingComplete(step);
@@ -247,7 +246,7 @@ public final class StepExecutor {
                 WebElement element = visible(step);
                 Assert.assertTrue(element.isDisplayed(), "Element is not visible: " + step.locatorKey());
                 String text = shownText(element);
-                yield text.isBlank() ? "Visible: " + step.locatorKey() : text;
+                yield label(step.locatorKey()) + " is visible" + (text.isBlank() ? "" : ": " + text);
             }
             // Verify records a failure and lets later steps continue.
             case "VERIFY_VISIBLE" -> {
@@ -255,7 +254,7 @@ public final class StepExecutor {
                 try { displayed = visible(step).isDisplayed(); }
                 catch (TimeoutException missing) { displayed = false; }
                 softAssert.assertTrue(displayed, "Element is not visible: " + step.locatorKey());
-                yield Boolean.toString(displayed);
+                yield label(step.locatorKey()) + (displayed ? " is visible" : " is not visible");
             }
             case "ASSERT_COUNT" -> {
                 int count = Integer.parseInt(resolve(expected));
@@ -268,18 +267,18 @@ public final class StepExecutor {
                 }
                 long actual = visibleCount(step);
                 Assert.assertEquals(actual, (long) count, "Visible count mismatch for " + step.locatorKey());
-                yield "Visible count for " + step.locatorKey() + ": " + actual;
+                yield "Visible count for " + label(step.locatorKey()) + ": " + actual;
             }
             case "ASSERT_TEXT" -> {
                 String text = visible(step).getText();
                 Assert.assertEquals(text, resolve(expected), "Visible text mismatch");
-                yield text;
+                yield label(step.locatorKey()) + " shows " + text;
             }
             case "VERIFY_TEXT" -> {
                 try {
                     String text = visible(step).getText();
                     softAssert.assertEquals(text, resolve(expected), "Visible text mismatch");
-                    yield text;
+                    yield label(step.locatorKey()) + " shows " + text;
                 } catch (TimeoutException missing) {
                     softAssert.fail("Text element missing: " + step.locatorKey());
                     yield "Text element missing: " + step.locatorKey();
@@ -290,9 +289,9 @@ public final class StepExecutor {
                 String current = driver.getCurrentUrl();
                 Assert.assertTrue(current.contains(resolve(expected)),
                     "URL did not contain expected text. Actual: " + current);
-                yield current;
+                yield "Current URL: " + current;
             }
-            case "ASSERT_DOWNLOAD" -> assertDownload(step, resolve(expected));
+            case "ASSERT_DOWNLOAD" -> "Found downloaded file " + assertDownload(step, resolve(expected));
             default -> throw new IllegalArgumentException("Unsupported action: " + step.action());
         };
     }
@@ -313,7 +312,7 @@ public final class StepExecutor {
         String newHandle = wait(step).until(ignored -> driver.getWindowHandles().stream()
             .filter(handle -> !before.contains(handle)).findFirst().orElse(null));
         switchToWindow(newHandle);
-        return "Clicked " + step.locatorKey() + " and switched to its new window";
+        return "Clicked " + label(step.locatorKey()) + " and switched to the new tab";
     }
 
     // Allow time for Duo approval, then wait for the Student Hub host.
@@ -339,8 +338,8 @@ public final class StepExecutor {
             }
             return false;
         });
-        return "Authenticated at " + driver.getCurrentUrl()
-            + (answeredPrompts.isEmpty() ? "" : "; answered prompts: " + String.join(", ", answeredPrompts));
+        return "Signed in and reached " + driver.getCurrentUrl()
+            + (answeredPrompts.isEmpty() ? "" : ", answering " + String.join(" and ", answeredPrompts));
     }
 
     private void answerSignInPrompt() {
@@ -850,6 +849,11 @@ public final class StepExecutor {
     }
 
     // Look up the selector and fill in any Data-sheet placeholders.
+    // Turn an Excel key such as resources_tab into words for the report.
+    public static String label(String key) {
+        return key == null ? "" : key.replace('_', ' ');
+    }
+
     private By by(String key) {
         LocatorDefinition locator = locators.get(key);
         if (locator == null) throw new IllegalArgumentException("Unknown locator key: " + key);
