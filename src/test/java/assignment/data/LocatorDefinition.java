@@ -2,12 +2,13 @@ package assignment.data;
 
 import org.openqa.selenium.By;
 
-/** Excel-defined selector converted to Selenium's locator representation at runtime. */
+/** Converts a selector from Excel into a Selenium locator. */
 public record LocatorDefinition(String strategy, String selector) {
     public By toBy() {
         return toBy(selector);
     }
 
+    // Use the selector after any Excel placeholders have been filled in.
     public By toBy(String resolvedSelector) {
         return switch (strategy) {
             case "css" -> By.cssSelector(resolvedSelector);

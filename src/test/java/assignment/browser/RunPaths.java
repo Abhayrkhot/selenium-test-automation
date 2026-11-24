@@ -4,7 +4,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-/** Creates filesystem-safe screenshot and download folders for the current run. */
+/** Keeps screenshots and downloads under the report folder. */
 public final class RunPaths {
     private final Path root;
 
@@ -14,18 +14,22 @@ public final class RunPaths {
     }
 
     public Path screenshotDirectory(String scenarioId, String scenarioName) throws IOException {
-        return create("screenshots", scenarioId + "-" + safeName(scenarioName));
+        // One folder per scenario, named after it, e.g. screenshots/S01-download-latest-transcript.
+        Path directory = root.resolve("screenshots").resolve(scenarioId + "-" + safeName(scenarioName));
+        Files.createDirectories(directory);
+        // Remove screenshots from an earlier run so the report links only this run's evidence.
+        try (var earlier = Files.list(directory)) {
+            for (Path file : earlier.filter(path -> path.getFileName().toString().endsWith(".png")).toList()) {
+                Files.delete(file);
+            }
+        }
+        return directory;
     }
 
-    public Path freshDownloadDirectory(String scenarioId, String scenarioName) throws IOException {
-        return create("downloads", scenarioId + "-" + safeName(scenarioName));
-    }
-
-    private Path create(String category, String name) throws IOException {
-        // Each scenario gets its own evidence folder so report links remain unambiguous.
-        Path path = root.resolve(category).resolve(name);
-        Files.createDirectories(path);
-        return path;
+    // Give each run a separate download folder.
+    public Path freshDownloadDirectory() throws IOException {
+        Files.createDirectories(root.resolve("downloads"));
+        return Files.createTempDirectory(root.resolve("downloads"), "suite-").toAbsolutePath();
     }
 
     public static String safeName(String value) {

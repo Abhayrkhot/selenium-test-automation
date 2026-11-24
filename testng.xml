@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
+<!-- Run scenarios sequentially in one browser session. -->
 <suite name="Northeastern end-to-end assignment" parallel="none" thread-count="1" configfailurepolicy="continue">
+  <!-- Write the HTML report after the suite finishes. -->
   <listeners>
     <listener class-name="assignment.reporting.AssignmentReportListener"/>
   </listeners>

@@ -4,11 +4,8 @@ import assignment.browser.BrowserSession;
 import assignment.browser.RunPaths;
 import assignment.data.StepDefinition;
 import assignment.data.WorkbookData;
-import assignment.reporting.ScenarioReportEntry;
-import assignment.reporting.ScenarioReportStore;
-import assignment.steps.ScenarioRunner;
-import assignment.steps.ScreenshotManager;
-import assignment.steps.StepEvidence;
+import assignment.reporting.AssignmentReportListener;
+import assignment.reporting.AssignmentReportListener.Entry;
 import assignment.steps.StepExecutor;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -24,6 +21,7 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
+import org.testng.asserts.SoftAssert;
 
 /** Executes the five assignment scenarios in one authenticated browser session. */
 public class AssignmentScenarioTest {
@@ -31,21 +29,24 @@ public class AssignmentScenarioTest {
     private BrowserSession browser;
     private Path downloads;
 
+    // Load the chosen workbook and start one browser for the full suite.
     @BeforeClass
     public void startBrowser() throws Exception {
         workbook = WorkbookData.load(Path.of(System.getProperty("workbook")));
-        var paths = new RunPaths(ScenarioReportStore.root());
-        downloads = paths.freshDownloadDirectory("suite", "shared-browser-downloads");
+        var paths = new RunPaths(AssignmentReportListener.REPORT_ROOT);
+        downloads = paths.freshDownloadDirectory();
         boolean headless = Boolean.parseBoolean(System.getProperty("headless", "false"));
         // One browser preserves SSO after the single permitted Duo interaction.
         browser = BrowserSession.start(downloads, headless);
     }
 
+    // Close Chrome even when a scenario fails.
     @AfterClass(alwaysRun = true)
     public void stopBrowser() {
         if (browser != null) browser.close();
     }
 
+    // Give TestNG one scenario at a time so they can share the login.
     @DataProvider(name = "scenarios", parallel = false)
     public Object[][] scenarios() throws Exception {
         if (workbook == null) workbook = WorkbookData.load(Path.of(System.getProperty("workbook")));
@@ -61,6 +62,7 @@ public class AssignmentScenarioTest {
         return values;
     }
 
+    // An empty scenarioIds setting means run all five scenarios.
     private static Set<String> selectedScenarioIds() {
         String configured = System.getProperty("scenarioIds", "").trim();
         if (configured.isEmpty()) return Set.of();
@@ -75,29 +77,43 @@ public class AssignmentScenarioTest {
         String name = scenario.get("scenario_name");
         List<StepDefinition> steps = workbook.stepsFor(id);
         Map<String, String> data = workbook.dataValues();
-        String expected = expectedSummary(steps, data);
+        String expected = scenario.get("description") + " | " + expectedSummary(steps, data);
         String actual = "Scenario did not start";
         boolean passed = false;
         Throwable failure = null;
         Path screenshots = null;
+        var checks = new ArrayList<String>();
+        boolean intendedAssertionReached = false;
+        boolean zipVerified = false;
 
         try {
             useOpenWindow(browser.driver());
-            var paths = new RunPaths(ScenarioReportStore.root());
+            var paths = new RunPaths(AssignmentReportListener.REPORT_ROOT);
             screenshots = paths.screenshotDirectory(id, name);
-            var screenshotManager = new ScreenshotManager(browser.driver(), screenshots);
-            var executor = new StepExecutor(browser.driver(), downloads, screenshotManager, data,
-                workbook.locators(), data);
-            List<StepEvidence> evidence = new ScenarioRunner(executor).run(steps);
-            actual = actualSummary(evidence);
+            var executor = new StepExecutor(browser.driver(), downloads, screenshots, data, workbook.locators());
+            // Verify failures are collected; Assert failures stop the current scenario.
+            var verify = new SoftAssert();
+            for (StepDefinition step : steps) {
+                // Only the final wrong-filename assertion counts as the designed failure.
+                intendedAssertionReached = "FAIL".equals(scenario.get("intended_outcome"))
+                    && step == steps.get(steps.size() - 1) && "ASSERT_DOWNLOAD".equals(step.action())
+                    && zipVerified;
+                String result = executor.execute(step, verify);
+                if ("ASSERT_NEW_ZIP".equals(step.action())) zipVerified = true;
+                if (!result.isBlank()) checks.add(result);
+            }
+            intendedAssertionReached = false;
+            verify.assertAll();
+            actual = checks.isEmpty() ? "All " + steps.size() + " steps completed" : String.join(" | ", checks);
             passed = true;
         } catch (Throwable error) {
             failure = error;
-            actual = failureSummary(error);
+            // Keep earlier observations alongside the failure in the report.
+            actual = (checks.isEmpty() ? "" : String.join(" | ", checks) + " | ") + failureSummary(error);
         } finally {
-            // Record the observed result. intended_outcome never converts Scenario 4 into a pass.
-            ScenarioReportStore.add(new ScenarioReportEntry(order, name, actual, expected, passed,
-                "FAIL".equals(scenario.get("intended_outcome")), screenshots));
+            // An intended failure is still reported as FAIL.
+            AssignmentReportListener.add(new Entry(order, name, actual, expected, passed,
+                intendedAssertionReached && failure instanceof AssertionError, screenshots));
         }
 
         if (failure != null) throw failure;
@@ -116,6 +132,7 @@ public class AssignmentScenarioTest {
         driver.switchTo().defaultContent();
     }
 
+    // Show expected values from Excel without repeating them.
     private static String expectedSummary(List<StepDefinition> steps, Map<String, String> data) {
         var expected = new LinkedHashSet<String>();
         for (StepDefinition step : steps) {
@@ -124,24 +141,8 @@ public class AssignmentScenarioTest {
         return expected.isEmpty() ? "All workbook-defined steps complete" : String.join(" | ", expected);
     }
 
-    private static String actualSummary(List<StepEvidence> evidence) {
-        var actual = new ArrayList<String>();
-        for (StepEvidence step : evidence) {
-            // Checks, how the PDF was saved, and any click that needed the JavaScript fallback
-            // all appear in the report's Actual column.
-            if (step.action().startsWith("ASSERT_") || step.action().startsWith("VERIFY_")
-                    || "PRINT_TO_PDF".equals(step.action())) {
-                actual.add(step.actual());
-            } else if (step.actual().contains(StepExecutor.JS_CLICK_NOTE)) {
-                actual.add("Step " + step.order() + ": " + step.actual());
-            }
-        }
-        return actual.isEmpty() ? "All " + evidence.size() + " steps completed" : String.join(" | ", actual);
-    }
-
     private static String failureSummary(Throwable failure) {
-        // Show the whole chain ("Step 16 PRINT_TO_PDF failed: Chrome's print dialog did not save ...")
-        // so the report says why a step failed, not just which one.
+        // Include the cause as well as the failed step.
         var messages = new ArrayList<String>();
         for (Throwable current = failure; current != null && messages.size() < 3; current = current.getCause()) {
             String message = current.getMessage();

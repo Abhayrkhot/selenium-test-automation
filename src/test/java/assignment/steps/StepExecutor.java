@@ -14,7 +14,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
@@ -33,6 +32,9 @@ import org.openqa.selenium.WebDriverException;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
 import org.openqa.selenium.WindowType;
+import org.openqa.selenium.OutputType;
+import org.openqa.selenium.TakesScreenshot;
+import org.openqa.selenium.TimeoutException;
 import org.openqa.selenium.interactions.Actions;
 import org.openqa.selenium.print.PrintOptions;
 import org.openqa.selenium.support.ui.ExpectedConditions;
@@ -41,62 +43,81 @@ import org.openqa.selenium.support.ui.WebDriverWait;
 import org.testng.Assert;
 import org.testng.asserts.SoftAssert;
 
-/** Executes workbook-defined steps and always attempts before/after screenshots. */
+/** Runs Excel actions and captures the page before and after each step. */
 public final class StepExecutor {
     private static final List<String> PARTIAL_DOWNLOAD_SUFFIXES = List.of(".crdownload", ".part", ".tmp");
     private static final String SIGN_IN_PROMPTS = "post_duo_prompts";
     private static final String DROPDOWN_OPTION = "dropdown_option";
     private final WebDriver driver;
     private final Path downloadDirectory;
-    private final ScreenshotManager screenshots;
+    private final Path screenshots;
     private final Map<String, String> data;
     private final Map<String, LocatorDefinition> locators;
-    private final Map<String, String> placeholders;
+    private final Set<Path> previousDownloads;
+    private final Map<String, String> rememberedValues = new java.util.HashMap<>();
     private String activeFrameKey;
-    // Set when safeClick had to fall back to a JavaScript click during the current step.
+    private String contextMenuLocator;
+    // Print candidates must be near the last right-click.
+    private java.awt.Point rightClickPoint;
+    private static final int MAX_MENU_DISTANCE = 400;
+    // Record when a blocked mouse click needed JavaScript instead.
     private boolean javaScriptClickUsed;
     public static final String JS_CLICK_NOTE = "(real click was intercepted; clicked with JavaScript instead)";
     private final List<String> answeredPrompts = new ArrayList<>();
 
-    public StepExecutor(WebDriver driver, Path downloadDirectory, ScreenshotManager screenshots,
-                        Map<String, String> data, Map<String, LocatorDefinition> locators,
-                        Map<String, String> placeholders) {
+    public StepExecutor(WebDriver driver, Path downloadDirectory, Path screenshots,
+                        Map<String, String> data, Map<String, LocatorDefinition> locators) throws IOException {
         this.driver = driver;
         this.downloadDirectory = downloadDirectory;
         this.screenshots = screenshots;
         this.data = data;
         this.locators = locators;
-        this.placeholders = placeholders;
+        // Remember existing files so later assertions look for new downloads.
+        try (var files = Files.list(downloadDirectory)) {
+            previousDownloads = files.collect(java.util.stream.Collectors.toSet());
+        }
     }
 
-    public StepEvidence execute(StepDefinition step, SoftAssert softAssert) {
-        Path before = null;
-        Path after = null;
+    // Run one step, keep failure evidence, then pass the result back to the report.
+    public String execute(StepDefinition step, SoftAssert softAssert) {
         Throwable failure = null;
         String actual = "";
         String expected = value(step.expectedKey());
         javaScriptClickUsed = false;
         try {
-            before = screenshots.capture(step.order(), step.action(), "before");
+            capture(step, "before");
             actual = perform(step, expected, softAssert);
             if (javaScriptClickUsed) actual += " " + JS_CLICK_NOTE;
         } catch (Throwable error) {
             failure = error;
         } finally {
             try {
-                after = screenshots.capture(step.order(), step.action(), "after");
+                capture(step, "after");
             } catch (Throwable screenshotError) {
+                // Keep the step error if its after-screenshot also fails.
                 if (failure == null) failure = screenshotError;
                 else failure.addSuppressed(screenshotError);
             }
         }
         if (failure != null) {
             if (failure instanceof AssertionError assertion) throw assertion;
-            throw new StepExecutionException("Step %d %s failed".formatted(step.order(), step.action()), failure);
+            throw new IllegalStateException("Step %d %s failed".formatted(step.order(), step.action()), failure);
         }
-        return new StepEvidence(step.order(), step.action(), actual, expected, before, after);
+        // Only return observations useful in the report; typed values stay out of it.
+        return step.action().startsWith("ASSERT_") || step.action().startsWith("VERIFY_")
+                || Set.of("PRINT_TO_PDF", "CLICK_IF_PRESENT", "CHANGE_CHECKBOX",
+                    "WAIT_FOR_AUTHENTICATION").contains(step.action()) || javaScriptClickUsed ? actual : "";
     }
 
+    // Number filenames by step and label them before or after.
+    private void capture(StepDefinition step, String position) throws IOException {
+        Files.createDirectories(screenshots);
+        Path file = screenshots.resolve("%02d-%s-%s.png".formatted(
+            step.order(), step.action().toLowerCase(), position));
+        Files.write(file, ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES));
+    }
+
+    // Map the action name in Excel to a browser action or check.
     private String perform(StepDefinition step, String expected, SoftAssert softAssert) {
         return switch (step.action()) {
             case "OPEN" -> {
@@ -110,14 +131,44 @@ public final class StepExecutor {
                 WebElement element = visible(step);
                 element.clear();
                 element.sendKeys(input);
-                yield element.getAttribute("value");
+                yield "Entered " + step.inputKey();
             }
             case "CLICK" -> {
                 safeClick(clickable(step));
                 yield "Clicked " + step.locatorKey();
             }
+            // Missing optional controls are logged. A visible but unusable control still fails.
+            case "CLICK_IF_PRESENT" -> {
+                WebElement element;
+                try { element = clickable(step); }
+                catch (TimeoutException absent) {
+                    if (driver.findElements(by(step.locatorKey())).stream().anyMatch(WebElement::isDisplayed)) throw absent;
+                    // For transcript Submit, absence is still a requirement gap, not proof of a click.
+                    yield "Optional control absent: " + step.locatorKey();
+                }
+                safeClick(element);
+                yield "Clicked optional control: " + step.locatorKey();
+            }
+            // Save the date before using the picker, then require it to change.
+            case "REMEMBER_VALUE" -> {
+                rememberedValues.put(step.locatorKey(), visible(step).getDomProperty("value"));
+                yield "";
+            }
+            case "ASSERT_VALUE_CHANGED" -> {
+                String original = rememberedValues.get(step.locatorKey());
+                Assert.assertNotNull(original, "No initial field value recorded");
+                try {
+                    wait(step).until(ignored -> {
+                        String current = visible(step).getDomProperty("value");
+                        return current != null && !current.isBlank() && !current.equals(original);
+                    });
+                } catch (TimeoutException unchanged) {
+                    Assert.fail("Date did not change; choose a different day in Excel", unchanged);
+                }
+                yield "Date changed from " + original + " to " + visible(step).getDomProperty("value");
+            }
             case "CLICK_AND_SWITCH" -> clickAndSwitch(step);
-            case "CLICK_AND_SWITCH_IF_OPENED" -> clickAndSwitchIfOpened(step);
+            // Use Select for native dropdowns; CHOOSE_OPTION handles custom menus.
             case "SELECT_TEXT" -> {
                 String option = resolve(value(step.inputKey()));
                 new Select(visible(step)).selectByVisibleText(option);
@@ -139,24 +190,46 @@ public final class StepExecutor {
                 yield "Scrolled to " + step.locatorKey();
             }
             case "CONTEXT_CLICK" -> {
+                contextMenuLocator = step.locatorKey();
                 WebElement element = visible(step);
-                // Keep Chrome's context menu visible briefly so the presentation shows
-                // the required right-click before the PDF is generated.
-                new Actions(driver).contextClick(element).pause(Duration.ofSeconds(2)).perform();
+                // Use the real mouse for the visible macOS menu.
+                if (isVisibleRun() && isMac()) {
+                    nativeContextClick(element);
+                } else {
+                    new Actions(driver).contextClick(element).pause(Duration.ofSeconds(2)).perform();
+                }
                 yield "Right-clicked " + step.locatorKey();
             }
-            case "SET_CHECKBOX" -> {
-                WebElement checkbox = present(step);
-                boolean desired = Boolean.parseBoolean(resolve(value(step.inputKey())));
+            case "SET_CHECKBOX", "CHANGE_CHECKBOX" -> {
+                String input = resolve(value(step.inputKey()));
+                if (!Set.of("true", "false", "0", "1").contains(input.toLowerCase())) {
+                    throw new IllegalArgumentException("Checkbox value must be true, false, 0 or 1");
+                }
+                boolean desired = "true".equalsIgnoreCase(input) || "1".equals(input);
+                // CHANGE_CHECKBOX must choose a box whose current state differs from the target.
+                WebElement checkbox = "CHANGE_CHECKBOX".equals(step.action())
+                    ? firstMatch(step, element -> checkboxState(element) != desired) : present(step);
+                // Retain the chosen checkbox's position when Trumba replaces the frame.
+                int checkboxIndex = driver.findElements(by(step.locatorKey())).indexOf(checkbox);
+                boolean original = checkboxState(checkbox);
                 if (checkboxState(checkbox) != desired) {
                     // Trumba visually replaces its native checkbox, leaving the real input hidden.
                     if (checkbox.isDisplayed()) checkbox.click();
                     else ((JavascriptExecutor) driver).executeScript("arguments[0].click();", checkbox);
                 }
-                wait(step).until(ignored -> checkboxState(present(step)) == desired);
-                Assert.assertEquals(checkboxState(present(step)), desired, "Checkbox state mismatch");
-                yield Boolean.toString(desired);
+                wait(step).until(ignored -> {
+                    try {
+                        reenterActiveFrame();
+                        var matches = driver.findElements(by(step.locatorKey()));
+                        return checkboxIndex >= 0 && matches.size() > checkboxIndex
+                            && checkboxState(matches.get(checkboxIndex)) == desired;
+                    } catch (NotFoundException | StaleElementReferenceException replaced) {
+                        return false;
+                    }
+                });
+                yield "Checkbox " + (checkboxIndex + 1) + " changed from " + original + " to " + desired;
             }
+            // Remember the frame locator in case the page replaces that frame.
             case "SWITCH_TO_IFRAME" -> {
                 wait(step).until(ExpectedConditions.frameToBeAvailableAndSwitchToIt(by(step.locatorKey())));
                 activeFrameKey = step.locatorKey();
@@ -167,7 +240,6 @@ public final class StepExecutor {
                 driver.switchTo().defaultContent();
                 yield "Switched to default content";
             }
-            case "SWITCH_TO_NEW_WINDOW" -> switchToNewWindow(step);
             case "WAIT_FOR_AUTHENTICATION" -> waitForAuthentication(step);
             case "WAIT_FOR_LOADING_COMPLETE" -> waitForLoadingComplete(step);
             case "PRINT_TO_PDF" -> printToPdf(step);
@@ -177,10 +249,26 @@ public final class StepExecutor {
                 String text = shownText(element);
                 yield text.isBlank() ? "Visible: " + step.locatorKey() : text;
             }
+            // Verify records a failure and lets later steps continue.
             case "VERIFY_VISIBLE" -> {
-                boolean displayed = visible(step).isDisplayed();
+                boolean displayed;
+                try { displayed = visible(step).isDisplayed(); }
+                catch (TimeoutException missing) { displayed = false; }
                 softAssert.assertTrue(displayed, "Element is not visible: " + step.locatorKey());
                 yield Boolean.toString(displayed);
+            }
+            case "ASSERT_COUNT" -> {
+                int count = Integer.parseInt(resolve(expected));
+                if (count < 0) throw new IllegalArgumentException("ASSERT_COUNT requires a nonnegative count");
+                try {
+                    // Stop waiting once there are enough matches; the equality check rejects extras.
+                    wait(step).until(ignored -> visibleCount(step) >= count);
+                } catch (TimeoutException tooFew) {
+                    // Report the observed count below rather than a generic wait timeout.
+                }
+                long actual = visibleCount(step);
+                Assert.assertEquals(actual, (long) count, "Visible count mismatch for " + step.locatorKey());
+                yield "Visible count for " + step.locatorKey() + ": " + actual;
             }
             case "ASSERT_TEXT" -> {
                 String text = visible(step).getText();
@@ -188,10 +276,16 @@ public final class StepExecutor {
                 yield text;
             }
             case "VERIFY_TEXT" -> {
-                String text = visible(step).getText();
-                softAssert.assertEquals(text, resolve(expected), "Visible text mismatch");
-                yield text;
+                try {
+                    String text = visible(step).getText();
+                    softAssert.assertEquals(text, resolve(expected), "Visible text mismatch");
+                    yield text;
+                } catch (TimeoutException missing) {
+                    softAssert.fail("Text element missing: " + step.locatorKey());
+                    yield "Text element missing: " + step.locatorKey();
+                }
             }
+            case "ASSERT_NEW_ZIP" -> assertNewZip(step);
             case "ASSERT_URL_CONTAINS" -> {
                 String current = driver.getCurrentUrl();
                 Assert.assertTrue(current.contains(resolve(expected)),
@@ -203,15 +297,8 @@ public final class StepExecutor {
         };
     }
 
-    private String switchToNewWindow(StepDefinition step) {
-        String original = driver.getWindowHandle();
-        Set<String> originalOnly = Set.of(original);
-        wait(step).until(ignored -> driver.getWindowHandles().stream().anyMatch(handle -> !handle.equals(original)));
-        return driver.getWindowHandles().stream().filter(handle -> !originalOnly.contains(handle)).findFirst()
-            .map(handle -> {
-                switchToWindow(handle);
-                return "Switched from " + original + " to new window";
-            }).orElseThrow(() -> new IllegalStateException("No new browser window appeared"));
+    private long visibleCount(StepDefinition step) {
+        return driver.findElements(by(step.locatorKey())).stream().filter(WebElement::isDisplayed).count();
     }
 
     private void switchToWindow(String handle) {
@@ -219,6 +306,7 @@ public final class StepExecutor {
         driver.switchTo().window(handle);
     }
 
+    // Wait for a newly opened tab; do not switch to an unrelated existing tab.
     private String clickAndSwitch(StepDefinition step) {
         Set<String> before = driver.getWindowHandles();
         safeClick(clickable(step));
@@ -228,28 +316,27 @@ public final class StepExecutor {
         return "Clicked " + step.locatorKey() + " and switched to its new window";
     }
 
-    private String clickAndSwitchIfOpened(StepDefinition step) {
-        Set<String> before = driver.getWindowHandles();
-        safeClick(clickable(step));
-        try {
-            String newHandle = new WebDriverWait(driver, Duration.ofSeconds(5)).until(ignored ->
-                driver.getWindowHandles().stream().filter(handle -> !before.contains(handle))
-                    .findFirst().orElse(null));
-            switchToWindow(newHandle);
-            return "Clicked " + step.locatorKey() + " and switched to its new window";
-        } catch (RuntimeException noNewWindow) {
-            return "Clicked " + step.locatorKey() + " in the current window";
-        }
-    }
-
+    // Allow time for Duo approval, then wait for the Student Hub host.
     private String waitForAuthentication(StepDefinition step) {
         String authenticatedUrl = resolve(value("student_hub_url"));
         String expectedHost = URI.create(authenticatedUrl).getHost();
-        // Duo approval on the phone remains the only manual interaction. The redirect is a more
-        // reliable signal than forwarding terminal input through Maven during a live presentation.
-        wait(step).until(ignored -> {
+        // Follow either the automatic redirect or an explicit launcher, including a new tab.
+        Set<String> initialWindows = driver.getWindowHandles();
+        var clickedLaunchers = new java.util.HashSet<String>();
+        wait(step).ignoring(StaleElementReferenceException.class).until(ignored -> {
+            driver.getWindowHandles().stream().filter(handle -> !initialWindows.contains(handle))
+                .findFirst().ifPresent(this::switchToWindow);
             if (expectedHost.equalsIgnoreCase(URI.create(driver.getCurrentUrl()).getHost())) return true;
             answerSignInPrompt();
+            if (!step.locatorKey().isBlank()) {
+                var launcher = driver.findElements(by(step.locatorKey())).stream()
+                    .filter(element -> element.isDisplayed() && element.isEnabled()).findFirst();
+                if (launcher.isPresent() && !clickedLaunchers.contains(driver.getCurrentUrl())) {
+                    String sourceUrl = driver.getCurrentUrl();
+                    safeClick(launcher.get());
+                    clickedLaunchers.add(sourceUrl);
+                }
+            }
             return false;
         });
         return "Authenticated at " + driver.getCurrentUrl()
@@ -257,9 +344,7 @@ public final class StepExecutor {
     }
 
     private void answerSignInPrompt() {
-        // Duo's "trust this browser" and Microsoft's "stay signed in" can appear after any SSO
-        // redirect (login, Banner, Canvas). They come and go as redirects run, so a lookup or
-        // click may race a navigation; the caller's next poll simply looks again.
+        // SSO prompts can reappear when opening Banner or Canvas.
         if (activeFrameKey != null || !locators.containsKey(SIGN_IN_PROMPTS)) return;
         try {
             for (WebElement prompt : driver.findElements(by(SIGN_IN_PROMPTS))) {
@@ -275,8 +360,7 @@ public final class StepExecutor {
     }
 
     private String waitForLoadingComplete(StepDefinition step) {
-        // Pages such as Banner and LibCal keep working after the click that triggered them.
-        // Wait until none of the workbook's loading indicators is still displayed.
+        // Wait for both the document and the workbook-defined loading indicators.
         wait(step).until(ignored -> {
             Object ready = ((JavascriptExecutor) driver).executeScript("return document.readyState");
             boolean loading = driver.findElements(by(step.locatorKey()))
@@ -286,6 +370,7 @@ public final class StepExecutor {
         return "Page loading completed at " + driver.getCurrentUrl();
     }
 
+    // Save the page using the filename from Excel, then check the PDF header.
     private String printToPdf(StepDefinition step) {
         String filename = resolve(value(step.inputKey()));
         Path output = downloadDirectory.resolve(filename).normalize();
@@ -297,10 +382,11 @@ public final class StepExecutor {
             if (isVisibleRun()) {
                 try {
                     savePdfThroughChromeUi(output, step.timeoutSeconds());
-                    method = isWindows() ? "Chrome print (Save as PDF, kiosk printing on Windows)" : "Chrome print dialog";
+                    method = isWindows()
+                        ? "Chrome print to Save as PDF after the right-click (Windows kiosk printing)"
+                        : "Chrome native context-menu Print and Save as PDF";
                 } catch (IOException | IllegalStateException uiSaveFailed) {
-                    // No silent fallback: if the real print dialog did not save the PDF, the step fails
-                    // and the report says so. Close the dialogs first so the next scenario can still run.
+                    // Close failed print dialogs so the next scenario can continue.
                     closeOpenDialogs();
                     throw new IllegalStateException("Chrome's print dialog did not save the PDF: "
                         + uiSaveFailed.getMessage(), uiSaveFailed);
@@ -311,18 +397,20 @@ public final class StepExecutor {
                 method = "Selenium print API (headless run)";
             }
 
-            Path desktopCopy = copyToDesktop(output);
+            // This checks the file format, not the transcript contents.
+            try (var input = Files.newInputStream(output)) {
+                Assert.assertEquals(new String(input.readNBytes(5), java.nio.charset.StandardCharsets.US_ASCII),
+                    "%PDF-", "Saved transcript is not a PDF");
+            }
 
-            // Display the saved result in Chrome. This gives the presenter and the
-            // after-step screenshot visible evidence that the transcript became a PDF.
+            // Open the saved PDF for the after-step screenshot.
             driver.switchTo().newWindow(WindowType.TAB);
-            driver.navigate().to(desktopCopy.toUri().toString());
+            driver.navigate().to(output.toAbsolutePath().toUri().toString());
             new WebDriverWait(driver, Duration.ofSeconds(step.timeoutSeconds())).until(ignored ->
                 driver.getCurrentUrl().startsWith("file:")
                     && "complete".equals(((JavascriptExecutor) driver)
                         .executeScript("return document.readyState")));
-            return "Saved PDF via %s at %s; copied and opened %s"
-                .formatted(method, output.toAbsolutePath(), desktopCopy);
+            return "Saved and opened PDF via %s at %s".formatted(method, output.getFileName());
         } catch (IOException error) {
             throw new IllegalStateException("Could not save printed transcript PDF", error);
         }
@@ -332,28 +420,34 @@ public final class StepExecutor {
         return !Boolean.parseBoolean(System.getProperty("headless", "false"));
     }
 
+    private static boolean isMac() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+    }
+
     private void savePdfThroughChromeUi(Path output, int timeoutSeconds) throws IOException {
         if (isWindows()) {
-            // On Windows, Chrome started by the test often cannot take keyboard focus from the
-            // terminal, so keystrokes meant for the print dialog land in another window.
-            // BrowserSession starts Chrome with kiosk printing instead: window.print() saves
-            // straight to the preset "Save as PDF" destination with Chrome's own print engine.
+            // Windows uses kiosk printing; this path does not select the context-menu item.
             savePdfWithKioskPrinting(output, timeoutSeconds);
             return;
+        }
+        if (!isMac()) {
+            throw new IllegalStateException("Visible PDF printing is supported on macOS and Windows only");
         }
         try {
             Robot keyboard = new Robot();
             keyboard.setAutoDelay(150);
 
-            // CONTEXT_CLICK provides the required visible right-click. Triggering print
-            // from the page avoids operating-system-specific context-menu mnemonics while
-            // still showing Chrome's browser-owned print preview to the presenter.
-            ((JavascriptExecutor) driver).executeScript(
-                "setTimeout(() => window.print(), 250); return true;");
+            if (contextMenuLocator == null) throw new IllegalStateException("PRINT_TO_PDF requires a preceding CONTEXT_CLICK");
+            // WebDriver screenshots dismiss the menu, so open it again before selecting Print.
+            nativeContextClick(driver.findElement(by(contextMenuLocator)));
+            selectNativePrint();
             keyboard.delay(5000);
 
-            // BrowserSession presets Save as PDF as the preview destination. Enter opens
-            // the operating system's save dialog, whose filename field is selected by default.
+            // Save as PDF is preset; Enter opens the system save dialog.
             press(keyboard, KeyEvent.VK_ENTER);
             keyboard.delay(2000);
             chord(keyboard, selectAllModifier(), KeyEvent.VK_A);
@@ -369,22 +463,104 @@ public final class StepExecutor {
         }
     }
 
+    private void nativeContextClick(WebElement element) {
+        try {
+            // Focus this Selenium Chrome process, not another open Chrome window.
+            Object processId = ((org.openqa.selenium.HasCapabilities) driver).getCapabilities().getCapability("goog:processID");
+            if (!(processId instanceof Number)) throw new IOException("Chrome did not provide its browser process ID");
+            Process activation = new ProcessBuilder("/usr/bin/osascript", "-e",
+                "tell application \"System Events\" to set frontmost of first process whose unix id is "
+                    + ((Number) processId).longValue() + " to true").start();
+            if (!activation.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) || activation.exitValue() != 0) {
+                activation.destroyForcibly();
+                throw new IOException("Could not activate Chrome for the native context menu");
+            }
+            // Convert the element position to screen coordinates, allowing for browser borders.
+            var coordinates = (List<?>) ((JavascriptExecutor) driver).executeScript(
+                "const r=arguments[0].getBoundingClientRect();return [window.screenX+(window.outerWidth-window.innerWidth)/2+r.left+r.width/2,"
+                + "window.screenY+window.outerHeight-window.innerHeight+r.top+Math.min(r.height/2,window.innerHeight/2)];", element);
+            Robot mouse = new Robot();
+            mouse.setAutoDelay(150);
+            // Use this position to compare nearby Print candidates.
+            rightClickPoint = new java.awt.Point(((Number) coordinates.get(0)).intValue(),
+                ((Number) coordinates.get(1)).intValue());
+            mouse.mouseMove(rightClickPoint.x, rightClickPoint.y);
+            mouse.mousePress(InputEvent.BUTTON3_DOWN_MASK);
+            mouse.mouseRelease(InputEvent.BUTTON3_DOWN_MASK);
+            mouse.delay(500);
+        } catch (IOException | AWTException error) {
+            throw new IllegalStateException("Could not open the native page context menu", error);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while opening the native context menu", interrupted);
+        }
+    }
+
+    private void selectNativePrint() throws IOException {
+        Path image = Files.createTempFile("chrome-context-menu-", ".png");
+        try {
+            Robot mouse = new Robot();
+            java.awt.Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+            javax.imageio.ImageIO.write(mouse.createScreenCapture(new java.awt.Rectangle(screen)), "png", image.toFile());
+            // The local Swift helper reads Print labels from a screen capture.
+            Process process = new ProcessBuilder("/usr/bin/swift", "scripts/find-print-menu.swift", image.toString())
+                .redirectErrorStream(true).start();
+            if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                throw new IOException("Timed out locating native Print menu item");
+            }
+            String result = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+            if (process.exitValue() != 0) {
+                keepScreenCapture(image);
+                throw new IOException("Native menu recognition failed: " + result);
+            }
+            // Prefer the nearest Print label within the distance limit.
+            // A nearby page label can still be mistaken for a menu item.
+            java.awt.Point menuPrint = null;
+            double nearest = Double.MAX_VALUE;
+            for (String line : result.lines().toList()) {
+                if (!line.trim().matches("[0-9.]+\\s+[0-9.]+")) continue;
+                String[] point = line.trim().split("\\s+");
+                var candidate = new java.awt.Point((int) (Double.parseDouble(point[0]) * screen.width),
+                    (int) (Double.parseDouble(point[1]) * screen.height));
+                double distance = candidate.distance(rightClickPoint);
+                if (distance < nearest) {
+                    nearest = distance;
+                    menuPrint = candidate;
+                }
+            }
+            if (menuPrint == null || nearest > MAX_MENU_DISTANCE) {
+                keepScreenCapture(image);
+                throw new IOException("No Print item inside the right-click menu (nearest Print text was "
+                    + (menuPrint == null ? "not found" : (int) nearest + " points from the click") + ")");
+            }
+            mouse.mouseMove(menuPrint.x, menuPrint.y);
+            mouse.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+            mouse.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+        } catch (AWTException error) {
+            throw new IOException("Native mouse control unavailable", error);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted locating native Print", error);
+        } finally { Files.deleteIfExists(image); }
+    }
+
+    private void keepScreenCapture(Path image) throws IOException {
+        // Save what the screen showed so the report explains why Print was not clicked.
+        Files.createDirectories(screenshots);
+        Files.copy(image, screenshots.resolve("print-menu-search-screen.png"), StandardCopyOption.REPLACE_EXISTING);
+    }
+
     private void closeOpenDialogs() {
-        // Only used when the save already failed. Escape closes the Save As dialog, then Chrome's
-        // print preview. Like the save keystrokes, Robot types into the window in front, which during
-        // this step is Chrome's own print dialog.
+        // Escape closes the save dialog and then print preview.
         try {
             Robot keyboard = new Robot();
             keyboard.setAutoDelay(300);
             for (int i = 0; i < 2; i++) press(keyboard, KeyEvent.VK_ESCAPE);
             keyboard.delay(1000);
         } catch (AWTException ignored) {
-            // Without keyboard control there is nothing to close; the step still fails with its reason.
+            // Preserve the original save failure.
         }
-    }
-
-    private static boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase().contains("win");
     }
 
     private static int selectAllModifier() {
@@ -393,6 +569,7 @@ public final class StepExecutor {
             ? KeyEvent.VK_META : KeyEvent.VK_CONTROL;
     }
 
+    // Headless tests use the browser print API, not the native print menu.
     private void savePdfThroughSelenium(Path output) throws IOException {
         if (!(driver instanceof PrintsPage printable)) {
             throw new WebDriverException("The active browser does not support Selenium print-to-PDF");
@@ -401,21 +578,7 @@ public final class StepExecutor {
             printable.print(new PrintOptions()).getContent()));
     }
 
-    private Path copyToDesktop(Path output) throws IOException {
-        String configured = System.getProperty("transcriptOutputDirectory", "").trim();
-        Path desktopDirectory = configured.isEmpty()
-            ? Path.of(System.getProperty("user.home"), "Desktop", "Selenium")
-            : Path.of(configured);
-        Files.createDirectories(desktopDirectory);
-        Path desktopCopy = desktopDirectory.toAbsolutePath().normalize()
-            .resolve(output.getFileName()).normalize();
-        if (!desktopCopy.startsWith(desktopDirectory.toAbsolutePath().normalize())) {
-            throw new IllegalArgumentException("PDF filename must stay inside the Desktop output directory");
-        }
-        Files.copy(output, desktopCopy, StandardCopyOption.REPLACE_EXISTING);
-        return desktopCopy;
-    }
-
+    // Windows printing creates a new PDF named after the page title.
     private void savePdfWithKioskPrinting(Path output, int timeoutSeconds) throws IOException {
         Path folder = output.getParent();
         Set<Path> existing = pdfsIn(folder);
@@ -438,6 +601,7 @@ public final class StepExecutor {
             + " within " + timeoutSeconds + " seconds");
     }
 
+    // Track PDFs present before printing so an old file is not mistaken for the new one.
     private static Set<Path> pdfsIn(Path folder) throws IOException {
         try (Stream<Path> files = Files.list(folder)) {
             return files.filter(file -> file.getFileName().toString().toLowerCase().endsWith(".pdf"))
@@ -454,6 +618,7 @@ public final class StepExecutor {
         }
     }
 
+    // Wait for the save dialog to produce a nonempty file.
     private void waitForFile(Path output, int timeoutSeconds) throws IOException {
         long deadline = System.nanoTime() + Duration.ofSeconds(timeoutSeconds).toNanos();
         while (System.nanoTime() < deadline) {
@@ -473,6 +638,7 @@ public final class StepExecutor {
         keyboard.keyRelease(key);
     }
 
+    // Press a shortcut and release both keys so modifiers do not stay held.
     private static void chord(Robot keyboard, int modifier, int key) {
         keyboard.keyPress(modifier);
         keyboard.keyPress(key);
@@ -480,6 +646,7 @@ public final class StepExecutor {
         keyboard.keyRelease(modifier);
     }
 
+    // Type the PDF filename into the system save dialog.
     private static void type(Robot keyboard, String text) {
         for (char character : text.toCharArray()) {
             int key = KeyEvent.getExtendedKeyCodeForChar(character);
@@ -490,17 +657,46 @@ public final class StepExecutor {
         }
     }
 
+    // Require a new, stable ZIP with a nonempty entry before the negative filename check.
+    private String assertNewZip(StepDefinition step) {
+        var sizes = new java.util.HashMap<Path, Long>();
+        try {
+            Path zip = wait(step).until(ignored -> {
+                try (var files = Files.list(downloadDirectory)) {
+                    for (Path file : files.toList()) {
+                        if (previousDownloads.contains(file) || !file.getFileName().toString().toLowerCase().endsWith(".zip")
+                                || !completeNonEmptyFile(file)) continue;
+                        long size = Files.size(file);
+                        Long previous = sizes.put(file, size);
+                        if (previous == null || previous != size) continue;
+                        try (var archive = new java.util.zip.ZipFile(file.toFile())) {
+                            if (archive.stream().anyMatch(entry -> !entry.isDirectory() && entry.getSize() > 0)) return file;
+                        } catch (IOException incomplete) {
+                            // Retry while the archive is still being written.
+                        }
+                    }
+                } catch (IOException unreadable) {
+                    // Retry until the step's deadline.
+                }
+                return null;
+            });
+            return "Verified completed ZIP: " + zip.getFileName();
+        } catch (TimeoutException missing) {
+            throw new AssertionError("Download prerequisite failed: no new completed ZIP; " + downloadedFiles(), missing);
+        }
+    }
+
+    // Compare the downloaded filename with the exact value from Excel.
     private String assertDownload(StepDefinition step, String expectedFilename) {
         Path expectedFile = downloadDirectory.resolve(expectedFilename).normalize();
         if (!expectedFile.startsWith(downloadDirectory.normalize())) {
             throw new IllegalArgumentException("Download filename must not leave its scenario directory");
         }
-        FileTime started = FileTime.from(Instant.now());
         var wait = new WebDriverWait(driver, Duration.ofSeconds(step.timeoutSeconds()));
         try {
-            // Stop once the expected file arrives or every download started meanwhile has
-            // finished, so a wrong filename fails as soon as the real file is on disk.
-            wait.until(ignored -> completeNonEmptyFile(expectedFile) || downloadsSettledSince(started));
+            // Ignore files from earlier scenarios, but include downloads that completed
+            // before this assertion started (a small ZIP can finish during the click).
+            wait.until(ignored -> completeNonEmptyFile(expectedFile) || downloadsSettled());
         } catch (RuntimeException stillDownloading) {
             // Fall through: the listing below shows any partial download.
         }
@@ -508,20 +704,22 @@ public final class StepExecutor {
             Assert.fail("Expected downloaded file '%s'; downloads folder has: %s"
                 .formatted(expectedFilename, downloadedFiles()));
         }
-        return expectedFile.toAbsolutePath().toString();
+        return expectedFile.getFileName().toString();
     }
 
-    private boolean downloadsSettledSince(FileTime started) {
+    // A new nonempty file with no partial downloads lets a wrong filename fail promptly.
+    private boolean downloadsSettled() {
         try (Stream<Path> files = Files.list(downloadDirectory)) {
             List<Path> all = files.toList();
             boolean partial = all.stream().anyMatch(path -> PARTIAL_DOWNLOAD_SUFFIXES.stream()
                 .anyMatch(suffix -> path.getFileName().toString().endsWith(suffix)));
-            return !partial && all.stream().anyMatch(path -> modifiedTime(path).compareTo(started) > 0);
+            return !partial && all.stream().filter(path -> !previousDownloads.contains(path)).anyMatch(this::completeNonEmptyFile);
         } catch (IOException ignored) {
             return false;
         }
     }
 
+    // List filenames and sizes for failures without dumping file contents.
     private String downloadedFiles() {
         try (Stream<Path> files = Files.list(downloadDirectory)) {
             List<String> listing = files
@@ -553,6 +751,7 @@ public final class StepExecutor {
         }
     }
 
+    // Require a nonempty file and no remaining temporary download files.
     private boolean completeNonEmptyFile(Path expectedFile) {
         try {
             if (!Files.isRegularFile(expectedFile) || Files.size(expectedFile) == 0) return false;
@@ -566,16 +765,13 @@ public final class StepExecutor {
     }
 
     private void safeClick(WebElement element) {
-        // Center the element first so sticky headers, footers and banners do not cover it.
-        // 'instant' matters: sites with CSS smooth scrolling would otherwise still be moving
-        // when the real click fires.
+        // Instant scrolling avoids clicking while the page is still moving.
         ((JavascriptExecutor) driver).executeScript(
             "arguments[0].scrollIntoView({block:'center', inline:'nearest', behavior:'instant'});", element);
         try {
             element.click();
         } catch (ElementClickInterceptedException covered) {
-            // An overlay still covers the element: click it with JavaScript. This skips mouse
-            // events, so it is recorded and shown in the report rather than hidden.
+            // Record the JavaScript fallback because it bypasses normal mouse events.
             ((JavascriptExecutor) driver).executeScript("arguments[0].click();", element);
             javaScriptClickUsed = true;
             System.out.println("JavaScript click fallback used: real click was intercepted (" + covered.getMessage().lines().findFirst().orElse("") + ")");
@@ -583,15 +779,16 @@ public final class StepExecutor {
     }
 
     private WebElement visible(StepDefinition step) {
-        // React pages often keep hidden copies of controls in the DOM. Select the first
-        // currently displayed match instead of letting Selenium stop at a hidden copy.
+        // Ignore hidden copies of controls in responsive layouts.
         return firstMatch(step, WebElement::isDisplayed);
     }
 
+    // Some custom widgets keep the real input hidden but still present in the page.
     private WebElement present(StepDefinition step) {
         return firstMatch(step, element -> true);
     }
 
+    // Retry the lookup while redirects, prompts or frame replacements settle.
     private WebElement firstMatch(StepDefinition step, Predicate<WebElement> usable) {
         return wait(step).until(ignored -> {
             try {
@@ -607,13 +804,13 @@ public final class StepExecutor {
     }
 
     private void reenterActiveFrame() {
-        // Trumba replaces its iframe elements when a filter changes, which strands the
-        // driver in a detached frame; follow the replacement by locating the frame again.
+        // Calendar filters can replace the frame; find the current one again.
         if (activeFrameKey == null) return;
         driver.switchTo().defaultContent();
         driver.switchTo().frame(driver.findElement(by(activeFrameKey)));
     }
 
+    // Custom checkboxes use aria-checked; native inputs use isSelected.
     private boolean checkboxState(WebElement element) {
         String checked = element.getAttribute("aria-checked");
         if (checked != null) return "true".equals(checked);
@@ -621,8 +818,7 @@ public final class StepExecutor {
     }
 
     private WebElement clickable(StepDefinition step) {
-        // A locator may intentionally cover desktop/mobile variants. Only return a control
-        // that a user could click in the active layout.
+        // Only use visible, enabled controls.
         return firstMatch(step, element -> element.isDisplayed() && element.isEnabled());
     }
 
@@ -641,22 +837,26 @@ public final class StepExecutor {
         return template.toBy(resolve(template.selector().replace("${option}", xpathLiteral(option))));
     }
 
+    // Quote option text safely when it contains single or double quotes.
     private static String xpathLiteral(String text) {
         if (!text.contains("'")) return "'" + text + "'";
         if (!text.contains("\"")) return "\"" + text + "\"";
         return "concat('" + text.replace("'", "',\"'\",'") + "')";
     }
 
+    // Use the timeout from this Excel step.
     private WebDriverWait wait(StepDefinition step) {
         return new WebDriverWait(driver, Duration.ofSeconds(step.timeoutSeconds()));
     }
 
+    // Look up the selector and fill in any Data-sheet placeholders.
     private By by(String key) {
         LocatorDefinition locator = locators.get(key);
         if (locator == null) throw new IllegalArgumentException("Unknown locator key: " + key);
         return locator.toBy(resolve(locator.selector()));
     }
 
+    // Blank keys are optional; unknown keys indicate a workbook error.
     private String value(String key) {
         if (key == null || key.isBlank()) return "";
         String value = data.get(key);
@@ -664,9 +864,10 @@ public final class StepExecutor {
         return value;
     }
 
+    // Replace ${key} placeholders with Excel values and reject unresolved names.
     private String resolve(String value) {
         String resolved = value;
-        for (var entry : placeholders.entrySet()) {
+        for (var entry : data.entrySet()) {
             resolved = resolved.replace("${" + entry.getKey() + "}", entry.getValue());
         }
         if (resolved.matches(".*\\$\\{[^}]+}.*")) {

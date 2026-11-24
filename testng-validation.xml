@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
+<!-- Check Excel structure only; this suite does not start Chrome. -->
 <suite name="Workbook validation" parallel="none">
   <test name="Excel contract checks">
     <classes>

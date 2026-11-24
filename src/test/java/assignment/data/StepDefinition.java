@@ -1,6 +1,6 @@
 package assignment.data;
 
-/** Immutable representation of one Excel Steps row. */
+/** One Steps row; keys point to the Data and Locators sheets. */
 public record StepDefinition(
     String scenarioId,
     int order,
