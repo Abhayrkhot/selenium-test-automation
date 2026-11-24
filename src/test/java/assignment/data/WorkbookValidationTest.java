@@ -44,6 +44,14 @@ public class WorkbookValidationTest {
         for (var check : checks) Assert.assertEquals(book.dataValues().get(check.expectedKey()), "1");
     }
 
+    // Assert and verify step 
+    @Test
+    public void assignmentUsesAssertAndVerifySteps() throws Exception {
+        var steps = WorkbookData.load(workbookPath()).rows("Steps");
+        Assert.assertTrue(steps.stream().anyMatch(row -> row.get("action").startsWith("ASSERT_")), "No Assert step");
+        Assert.assertTrue(steps.stream().anyMatch(row -> row.get("action").startsWith("VERIFY_")), "No Verify step");
+    }
+
     // Check that key actions exist; this does not prove live-site compliance.
     @Test
     public void assignmentIncludesRequiredTransitions() throws Exception {
