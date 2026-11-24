@@ -17,6 +17,20 @@ import org.testng.asserts.SoftAssert;
 
 /** Local Chrome fixtures verify the framework, not the live Northeastern workflows. */
 public class FrameworkRegressionTest {
+    // Points read from a real run: the Mac save dialog's title and Save button, and the
+    // menu's Print item next to the transcript page's own Print link.
+    @Test
+    public void screenClicksPickTheRightLabel() {
+        var dialogTitle = new java.awt.Point(481, 153);
+        var dialogButton = new java.awt.Point(1118, 553);
+        Assert.assertEquals(StepExecutor.pick(java.util.List.of(dialogTitle, dialogButton), null), dialogButton);
+        var rightClick = new java.awt.Point(745, 535);
+        var pagePrintLink = new java.awt.Point(1397, 503);
+        var menuPrint = new java.awt.Point(778, 652);
+        Assert.assertEquals(StepExecutor.pick(java.util.List.of(pagePrintLink, menuPrint), rightClick), menuPrint);
+        Assert.assertNull(StepExecutor.pick(java.util.List.of(pagePrintLink), rightClick));
+    }
+
     // Use local pages to check scenario order, the designed failure and screenshot links.
     @Test
     public void sequencingAndFailureScreenshots() throws Exception {

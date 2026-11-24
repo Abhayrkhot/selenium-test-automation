@@ -59,7 +59,17 @@ public final class StepExecutor {
     private String contextMenuLocator;
     // Print candidates must be near the last right-click.
     private java.awt.Point rightClickPoint;
+    // While Chrome's right-click menu is open, screenshots come from the screen instead of
+    // Selenium, because a Selenium screenshot closes the menu.
+    private boolean nativeMenuOpen;
+    private java.awt.Rectangle chromeWindow;
+    // Set when the print step found the menu closed and had to right-click again.
+    private boolean menuReopened;
     private static final int MAX_MENU_DISTANCE = 400;
+    // The Swift screen reader, built once per run so each read is quicker.
+    private static final Path FINDER_SCRIPT = Path.of("scripts", "find-text-on-screen.swift");
+    private static final Path FINDER_PROGRAM = Path.of("target", "text-finder", "find-text-on-screen");
+    private static java.util.concurrent.CompletableFuture<Boolean> finderBuild;
     // Record when a blocked mouse click needed JavaScript instead.
     private boolean javaScriptClickUsed;
     public static final String JS_CLICK_NOTE = "(real click was intercepted; clicked with JavaScript instead)";
@@ -72,6 +82,7 @@ public final class StepExecutor {
         this.screenshots = screenshots;
         this.data = data;
         this.locators = locators;
+        if (isVisibleRun() && isMac()) buildTextFinder();
         // Remember existing files so later assertions look for new downloads.
         try (var files = Files.list(downloadDirectory)) {
             previousDownloads = files.collect(java.util.stream.Collectors.toSet());
@@ -91,6 +102,8 @@ public final class StepExecutor {
         } catch (Throwable error) {
             failure = error;
         } finally {
+            // Any step after the right-click closes the menu (the print step clicks Print).
+            if (!"CONTEXT_CLICK".equals(step.action())) nativeMenuOpen = false;
             try {
                 capture(step, "after");
             } catch (Throwable screenshotError) {
@@ -112,6 +125,16 @@ public final class StepExecutor {
         Files.createDirectories(screenshots);
         Path file = screenshots.resolve("%02d-%s-%s.png".formatted(
             step.order(), step.action().toLowerCase(), position));
+        if (nativeMenuOpen && chromeWindow != null) {
+            // Capture Chrome's window from the screen so the open menu stays open and shows.
+            try {
+                var area = chromeWindow.intersection(new java.awt.Rectangle(Toolkit.getDefaultToolkit().getScreenSize()));
+                javax.imageio.ImageIO.write(new Robot().createScreenCapture(area), "png", file.toFile());
+                return;
+            } catch (AWTException | IllegalArgumentException screenCaptureFailed) {
+                // Fall back to a Selenium screenshot below.
+            }
+        }
         Files.write(file, ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES));
     }
 
@@ -383,7 +406,8 @@ public final class StepExecutor {
                     savePdfThroughChromeUi(output, step.timeoutSeconds());
                     method = isWindows()
                         ? "Chrome print to Save as PDF after the right-click (Windows kiosk printing)"
-                        : "Chrome native context-menu Print and Save as PDF";
+                        : "Chrome native context-menu Print, then mouse clicks on Save"
+                            + (menuReopened ? " (the menu had closed, so it right-clicked again)" : "");
                 } catch (IOException | IllegalStateException uiSaveFailed) {
                     // Close failed print dialogs so the next scenario can continue.
                     closeOpenDialogs();
@@ -436,30 +460,26 @@ public final class StepExecutor {
         if (!isMac()) {
             throw new IllegalStateException("Visible PDF printing is supported on macOS and Windows only");
         }
-        try {
-            Robot keyboard = new Robot();
-            keyboard.setAutoDelay(150);
-
-            if (contextMenuLocator == null) throw new IllegalStateException("PRINT_TO_PDF requires a preceding CONTEXT_CLICK");
-            // WebDriver screenshots dismiss the menu, so open it again before selecting Print.
+        if (contextMenuLocator == null) throw new IllegalStateException("PRINT_TO_PDF requires a preceding CONTEXT_CLICK");
+        Set<Path> existing = pdfsIn(downloadDirectory);
+        // The menu from the CONTEXT_CLICK step is normally still open. Right-click again only if it closed.
+        java.awt.Point print = rightClickPoint == null ? null : pick(readScreenOnce("Print"), rightClickPoint);
+        menuReopened = print == null;
+        if (print == null) {
             nativeContextClick(driver.findElement(by(contextMenuLocator)));
-            selectNativePrint();
-            keyboard.delay(5000);
-
-            // Save as PDF is preset; Enter opens the system save dialog.
-            press(keyboard, KeyEvent.VK_ENTER);
-            keyboard.delay(2000);
-            chord(keyboard, selectAllModifier(), KeyEvent.VK_A);
-            type(keyboard, output.getFileName().toString());
-            keyboard.delay(500);
-            press(keyboard, KeyEvent.VK_ENTER);
-
-            waitForFile(output, timeoutSeconds);
-        } catch (AWTException error) {
-            throw new IllegalStateException(
-                "Could not control Chrome's visible print dialog. Allow Java to send keyboard input on this computer.",
-                error);
+            print = findOnScreen("Print", rightClickPoint, null, false, 10);
         }
+        // From here every choice is a mouse click; nothing is typed.
+        clickAt(print, InputEvent.BUTTON1_DOWN_MASK);
+        // Print preview opens with Save as PDF chosen. Click Save as soon as it turns blue.
+        java.awt.Point previewSave = findOnScreen("Save", null, null, false, timeoutSeconds);
+        waitUntilBlue(previewSave, 4000);
+        clickAt(previewSave, InputEvent.BUTTON1_DOWN_MASK);
+        // The Mac save dialog slides in with its own Save button; click it once it stops moving.
+        java.awt.Point dialogSave = findOnScreen("Save", null, previewSave, true, timeoutSeconds);
+        clickAt(dialogSave, InputEvent.BUTTON1_DOWN_MASK);
+        // Chrome saves under the page title, so give the file the name from Excel.
+        waitForNewPdf(existing, output, timeoutSeconds);
     }
 
     private void nativeContextClick(WebElement element) {
@@ -475,19 +495,20 @@ public final class StepExecutor {
                 throw new IOException("Could not activate Chrome for the native context menu");
             }
             // Convert the element position to screen coordinates, allowing for browser borders.
+            // Also read the window's position for the screenshots taken while the menu is open.
             var coordinates = (List<?>) ((JavascriptExecutor) driver).executeScript(
                 "const r=arguments[0].getBoundingClientRect();return [window.screenX+(window.outerWidth-window.innerWidth)/2+r.left+r.width/2,"
-                + "window.screenY+window.outerHeight-window.innerHeight+r.top+Math.min(r.height/2,window.innerHeight/2)];", element);
-            Robot mouse = new Robot();
-            mouse.setAutoDelay(150);
+                + "window.screenY+window.outerHeight-window.innerHeight+r.top+Math.min(r.height/2,window.innerHeight/2),"
+                + "window.screenX,window.screenY,window.outerWidth,window.outerHeight];", element);
+            chromeWindow = new java.awt.Rectangle(((Number) coordinates.get(2)).intValue(), ((Number) coordinates.get(3)).intValue(),
+                ((Number) coordinates.get(4)).intValue(), ((Number) coordinates.get(5)).intValue());
             // Use this position to compare nearby Print candidates.
             rightClickPoint = new java.awt.Point(((Number) coordinates.get(0)).intValue(),
                 ((Number) coordinates.get(1)).intValue());
-            mouse.mouseMove(rightClickPoint.x, rightClickPoint.y);
-            mouse.mousePress(InputEvent.BUTTON3_DOWN_MASK);
-            mouse.mouseRelease(InputEvent.BUTTON3_DOWN_MASK);
-            mouse.delay(500);
-        } catch (IOException | AWTException error) {
+            clickAt(rightClickPoint, InputEvent.BUTTON3_DOWN_MASK);
+            nativeMenuOpen = true;
+            pause(250);
+        } catch (IOException error) {
             throw new IllegalStateException("Could not open the native page context menu", error);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
@@ -495,59 +516,153 @@ public final class StepExecutor {
         }
     }
 
-    private void selectNativePrint() throws IOException {
-        Path image = Files.createTempFile("chrome-context-menu-", ".png");
+    // Look at the screen until the label appears, then return where to click it.
+    // near: pick the match closest to this point, within the right-click menu's reach.
+    // avoid: skip a match at this point, such as a button that was just clicked.
+    // steady: wait until the match is in the same spot on two reads in a row.
+    private java.awt.Point findOnScreen(String label, java.awt.Point near, java.awt.Point avoid, boolean steady,
+                                        int timeoutSeconds) throws IOException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(timeoutSeconds).toNanos();
+        Path image = Files.createTempFile("screen-", ".png");
         try {
-            Robot mouse = new Robot();
-            java.awt.Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
-            javax.imageio.ImageIO.write(mouse.createScreenCapture(new java.awt.Rectangle(screen)), "png", image.toFile());
-            // The local Swift helper reads Print labels from a screen capture.
-            Process process = new ProcessBuilder("/usr/bin/swift", "scripts/find-print-menu.swift", image.toString())
-                .redirectErrorStream(true).start();
-            if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                throw new IOException("Timed out locating native Print menu item");
-            }
-            String result = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
-            if (process.exitValue() != 0) {
-                keepScreenCapture(image);
-                throw new IOException("Native menu recognition failed: " + result);
-            }
-            // Prefer the nearest Print label within the distance limit.
-            // A nearby page label can still be mistaken for a menu item.
-            java.awt.Point menuPrint = null;
-            double nearest = Double.MAX_VALUE;
-            for (String line : result.lines().toList()) {
-                if (!line.trim().matches("[0-9.]+\\s+[0-9.]+")) continue;
-                String[] point = line.trim().split("\\s+");
-                var candidate = new java.awt.Point((int) (Double.parseDouble(point[0]) * screen.width),
-                    (int) (Double.parseDouble(point[1]) * screen.height));
-                double distance = candidate.distance(rightClickPoint);
-                if (distance < nearest) {
-                    nearest = distance;
-                    menuPrint = candidate;
-                }
-            }
-            if (menuPrint == null || nearest > MAX_MENU_DISTANCE) {
-                keepScreenCapture(image);
-                throw new IOException("No Print item inside the right-click menu (nearest Print text was "
-                    + (menuPrint == null ? "not found" : (int) nearest + " points from the click") + ")");
-            }
-            mouse.mouseMove(menuPrint.x, menuPrint.y);
-            mouse.mousePress(InputEvent.BUTTON1_DOWN_MASK);
-            mouse.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
-        } catch (AWTException error) {
-            throw new IOException("Native mouse control unavailable", error);
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted locating native Print", error);
+            java.awt.Point previous = null;
+            do {
+                List<java.awt.Point> matches = readScreen(label, image).stream()
+                    .filter(point -> avoid == null || point.distance(avoid) > 40).toList();
+                java.awt.Point choice = pick(matches, near);
+                if (choice != null && (!steady || (previous != null && choice.distance(previous) <= 5))) return choice;
+                previous = choice;
+                pause(150);
+            } while (System.nanoTime() < deadline);
+            keepScreenCapture(image, label);
+            throw new IOException("Could not find " + label + " on screen within " + timeoutSeconds + " seconds");
         } finally { Files.deleteIfExists(image); }
     }
 
-    private void keepScreenCapture(Path image) throws IOException {
-        // Save what the screen showed so the report explains why Print was not clicked.
+    // One quick look, used to check whether the right-click menu is still open.
+    private List<java.awt.Point> readScreenOnce(String label) throws IOException {
+        Path image = Files.createTempFile("screen-", ".png");
+        try {
+            return readScreen(label, image);
+        } finally { Files.deleteIfExists(image); }
+    }
+
+    // Capture the whole screen into the image file and return where the label appears.
+    private static List<java.awt.Point> readScreen(String label, Path image) throws IOException {
+        try {
+            java.awt.Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+            javax.imageio.ImageIO.write(new Robot().createScreenCapture(new java.awt.Rectangle(screen)), "png", image.toFile());
+            return readLabels(image, label, screen);
+        } catch (AWTException error) {
+            throw new IOException("Native screen capture unavailable", error);
+        }
+    }
+
+    // Choose which match to click.
+    static java.awt.Point pick(List<java.awt.Point> matches, java.awt.Point near) {
+        if (matches.isEmpty()) return null;
+        if (near != null) {
+            // Menu items: the match nearest the right-click, if it is inside the menu's reach.
+            var closest = matches.stream().min(Comparator.comparingDouble(point -> point.distance(near))).get();
+            return closest.distance(near) <= MAX_MENU_DISTANCE ? closest : null;
+        }
+        // Buttons: dialogs put their title at the top and Save at the bottom, so take the lowest.
+        return matches.stream().max(Comparator.comparingInt(point -> point.y)).get();
+    }
+
+    // Chrome shows Save in grey until the preview is ready, then draws the button blue.
+    private static void waitUntilBlue(java.awt.Point label, long maxMillis) {
+        try {
+            Robot robot = new Robot();
+            long deadline = System.currentTimeMillis() + maxMillis;
+            while (System.currentTimeMillis() < deadline) {
+                // Sample the button just above its text.
+                java.awt.Color color = robot.getPixelColor(label.x, label.y - 9);
+                if (color.getBlue() > 150 && color.getBlue() - color.getRed() > 60) return;
+                pause(100);
+            }
+        } catch (AWTException error) {
+            // Without a colour check, fall back to waiting the full time.
+            pause(maxMillis);
+        }
+    }
+
+    // Start building the Swift reader in the background; reads run the script directly until it is ready.
+    private static synchronized void buildTextFinder() {
+        if (finderBuild != null) return;
+        finderBuild = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            try {
+                Files.createDirectories(FINDER_PROGRAM.getParent());
+                Process build = new ProcessBuilder("/usr/bin/swiftc", "-O", FINDER_SCRIPT.toString(),
+                    "-o", FINDER_PROGRAM.toString()).redirectErrorStream(true).start();
+                build.getInputStream().readAllBytes();
+                return build.waitFor(120, java.util.concurrent.TimeUnit.SECONDS) && build.exitValue() == 0;
+            } catch (IOException error) {
+                return false;
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        });
+    }
+
+    private static List<String> finderCommand(Path image, String label) {
+        boolean built = finderBuild != null && finderBuild.isDone() && finderBuild.join();
+        return built ? List.of(FINDER_PROGRAM.toString(), image.toString(), label)
+            : List.of("/usr/bin/swift", FINDER_SCRIPT.toString(), image.toString(), label);
+    }
+
+    // Run the Swift reader and turn its x y fractions into screen points.
+    private static List<java.awt.Point> readLabels(Path image, String label, java.awt.Dimension screen) throws IOException {
+        Process process = new ProcessBuilder(finderCommand(image, label)).redirectErrorStream(true).start();
+        try {
+            if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                throw new IOException("Timed out reading the screen for " + label);
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted reading the screen", error);
+        }
+        String output = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+        // Exit 1 with "No visible ..." only means the label is not on screen yet.
+        if (process.exitValue() != 0 && !output.startsWith("No visible")) {
+            throw new IOException("Screen text reader failed: " + output);
+        }
+        var points = new ArrayList<java.awt.Point>();
+        for (String line : output.lines().toList()) {
+            if (!line.trim().matches("[0-9.]+\\s+[0-9.]+")) continue;
+            String[] parts = line.trim().split("\\s+");
+            points.add(new java.awt.Point((int) (Double.parseDouble(parts[0]) * screen.width),
+                (int) (Double.parseDouble(parts[1]) * screen.height)));
+        }
+        return points;
+    }
+
+    // Glide the real pointer to the target so viewers can follow it, then click.
+    private static void clickAt(java.awt.Point target, int button) {
+        try {
+            Robot mouse = new Robot();
+            var pointer = java.awt.MouseInfo.getPointerInfo();
+            java.awt.Point start = pointer == null ? target : pointer.getLocation();
+            int steps = 12;
+            for (int i = 1; i <= steps; i++) {
+                mouse.mouseMove(start.x + (target.x - start.x) * i / steps, start.y + (target.y - start.y) * i / steps);
+                mouse.delay(12);
+            }
+            mouse.delay(150);
+            mouse.mousePress(button);
+            mouse.mouseRelease(button);
+        } catch (AWTException error) {
+            throw new IllegalStateException("Native mouse control unavailable", error);
+        }
+    }
+
+    private void keepScreenCapture(Path image, String label) throws IOException {
+        // Save what the screen showed so the report explains why the label was not clicked.
         Files.createDirectories(screenshots);
-        Files.copy(image, screenshots.resolve("print-menu-search-screen.png"), StandardCopyOption.REPLACE_EXISTING);
+        Files.copy(image, screenshots.resolve("search-" + label.toLowerCase() + "-screen.png"),
+            StandardCopyOption.REPLACE_EXISTING);
     }
 
     private void closeOpenDialogs() {
@@ -562,12 +677,6 @@ public final class StepExecutor {
         }
     }
 
-    private static int selectAllModifier() {
-        int menuShortcut = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
-        return (menuShortcut & InputEvent.META_DOWN_MASK) != 0
-            ? KeyEvent.VK_META : KeyEvent.VK_CONTROL;
-    }
-
     // Headless tests use the browser print API, not the native print menu.
     private void savePdfThroughSelenium(Path output) throws IOException {
         if (!(driver instanceof PrintsPage printable)) {
@@ -579,25 +688,28 @@ public final class StepExecutor {
 
     // Windows printing creates a new PDF named after the page title.
     private void savePdfWithKioskPrinting(Path output, int timeoutSeconds) throws IOException {
-        Path folder = output.getParent();
-        Set<Path> existing = pdfsIn(folder);
+        Set<Path> existing = pdfsIn(downloadDirectory);
         ((JavascriptExecutor) driver).executeScript("setTimeout(() => window.print(), 250); return true;");
+        waitForNewPdf(existing, output, timeoutSeconds);
+    }
+
+    // Wait for a new PDF to finish writing, then give it the filename from Excel.
+    private void waitForNewPdf(Set<Path> existing, Path output, int timeoutSeconds) throws IOException {
         long deadline = System.nanoTime() + Duration.ofSeconds(timeoutSeconds).toNanos();
         while (System.nanoTime() < deadline) {
-            for (Path pdf : pdfsIn(folder)) {
+            for (Path pdf : pdfsIn(downloadDirectory)) {
                 if (existing.contains(pdf)) continue;
                 long size = Files.size(pdf);
-                pause(750);
+                pause(300);
                 // Chrome names the file after the page title; rename it once it has finished writing.
                 if (size > 0 && Files.exists(pdf) && Files.size(pdf) == size) {
                     if (!pdf.equals(output)) Files.move(pdf, output, StandardCopyOption.REPLACE_EXISTING);
                     return;
                 }
             }
-            pause(250);
+            pause(150);
         }
-        throw new IOException("Chrome's kiosk printing did not save a PDF in " + folder
-            + " within " + timeoutSeconds + " seconds");
+        throw new IOException("No new PDF was saved in " + downloadDirectory + " within " + timeoutSeconds + " seconds");
     }
 
     // Track PDFs present before printing so an old file is not mistaken for the new one.
@@ -617,43 +729,10 @@ public final class StepExecutor {
         }
     }
 
-    // Wait for the save dialog to produce a nonempty file.
-    private void waitForFile(Path output, int timeoutSeconds) throws IOException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(timeoutSeconds).toNanos();
-        while (System.nanoTime() < deadline) {
-            if (Files.isRegularFile(output) && Files.size(output) > 0) return;
-            try {
-                Thread.sleep(250);
-            } catch (InterruptedException error) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted while waiting for the PDF save dialog", error);
-            }
-        }
-        throw new IOException("Chrome did not save the PDF within " + timeoutSeconds + " seconds: " + output);
-    }
-
+    // Only used to close dialogs after a failed save.
     private static void press(Robot keyboard, int key) {
         keyboard.keyPress(key);
         keyboard.keyRelease(key);
-    }
-
-    // Press a shortcut and release both keys so modifiers do not stay held.
-    private static void chord(Robot keyboard, int modifier, int key) {
-        keyboard.keyPress(modifier);
-        keyboard.keyPress(key);
-        keyboard.keyRelease(key);
-        keyboard.keyRelease(modifier);
-    }
-
-    // Type the PDF filename into the system save dialog.
-    private static void type(Robot keyboard, String text) {
-        for (char character : text.toCharArray()) {
-            int key = KeyEvent.getExtendedKeyCodeForChar(character);
-            if (key == KeyEvent.VK_UNDEFINED) {
-                throw new IllegalArgumentException("Unsupported PDF filename character: " + character);
-            }
-            press(keyboard, key);
-        }
     }
 
     // Require a new, stable ZIP with a nonempty entry before the negative filename check.

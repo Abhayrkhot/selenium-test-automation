@@ -28,6 +28,7 @@ public class NativePrintTest {
                 Map.of("pdf", "native-print-test.pdf"), Map.of("page", new LocatorDefinition("css", "body")));
             executor.execute(new StepDefinition("fixture", 1, "CONTEXT_CLICK", "page", "", "", 10), new SoftAssert());
             String result = executor.execute(new StepDefinition("fixture", 2, "PRINT_TO_PDF", "", "pdf", "", 30), new SoftAssert());
+            System.out.println("Print step: " + result);
             Assert.assertTrue(result.contains("native context-menu"));
             // This checks file creation, not transcript text or an authenticated workflow.
             Assert.assertTrue(Files.size(downloads.resolve("native-print-test.pdf")) > 5);
